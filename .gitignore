@@ -1,0 +1,16 @@
+# Local environment and build output
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+
+# Personal data written while the app runs
+actions_log.csv
+config.json
+config.json.tmp
+timings.txt
+
+# Third-party VLC binaries: recreate with  python tools/prepare_vlc.py <vlc-3.0.24-win64.zip>
+vendor/

@@ -1,0 +1,4 @@
+FreeSimpleGUI==5.3.0.post1
+pillow==12.3.0
+pillow-heif==1.8.0
+python-vlc==3.0.21203
