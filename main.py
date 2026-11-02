@@ -51,6 +51,8 @@ THUMB = (160, 120)
 SEEK_H, SEEK_SIDE = 30, 70  # video position bar: height, room for the clock on each side
 SEEK_FILL = "#eceef2"
 TRASH_COLOUR = "#ef5a62"
+STATUS_H = 30  # the status line's own row
+MAX_PATH = 90  # longer paths lose their middle folders in the status line
 TIMING = os.environ.get("PHOTOSWIPE_TIMING") == "1"
 # Test hook: "keep,keep,delete,undo,..." is performed one action every 1.5 s (used to test the .exe).
 SCRIPT = [a for a in os.environ.get("PHOTOSWIPE_SCRIPT", "").split(",") if a]
@@ -79,6 +81,16 @@ def _rtl(text):
     """Hebrew mixed with numbers and Latin units ("שוקל 3.2 MB"): lay it out right-to-left, or
     inside the left-to-right status line the number jumps in front of the Hebrew word."""
     return f"‫{text}‬"
+
+
+def _short(rel):
+    """`a\\b\\...\\y\\name.jpg`: keeps the file name and the folder it is in, drops the middle."""
+    if len(rel) <= MAX_PATH:
+        return rel
+    parts = rel.split(os.sep)
+    tail = os.sep.join(parts[-2:])
+    head = parts[0] + os.sep + "…" + os.sep if len(parts) > 2 else "…"
+    return head + tail if len(head + tail) <= MAX_PATH else "…" + tail[-(MAX_PATH - 1):]
 
 
 def _size(path):
@@ -144,7 +156,7 @@ class App:
         if os.path.exists(ICON):
             sg.set_options(icon=ICON)  # every window, including the "next batch" question
         sw, sh = sg.Window.get_screen_size()
-        self.max_img = (max(320, sw - 40), max(240, sh - 250 - SEEK_H))
+        self.max_img = (max(320, sw - 40), max(240, sh - 250 - SEEK_H - STATUS_H))
         try:
             self._logo = Image.open(LOGO).convert("RGBA")
         except OSError:
@@ -187,16 +199,22 @@ class App:
             actions.append(sg.Button(f"{label}\n{hint}", key=key, font=(FONT, 12, "bold"), size=(12, 2),
                                      button_color=(fg, bg), mouseover_colors=(fg, hover), border_width=0,
                                      pad=(6, 4)))
+        # The controls get a row of their own, so a long file name in the status line below
+        # can never push them off the right edge of the screen.
+        what = [sg.Text("מה למיין:", font=(FONT, 10, "bold"), background_color=PANEL, pad=((14, 0), 6))] \
+            if VIDEOS_ENABLED else []
         top = [
             sg.Image(key="-LOGO-", size=(30, 30), background_color=PANEL, pad=((10, 4), 6)),
             sg.Text("PhotoSwipe", font=(FONT, 14, "bold"), background_color=PANEL, pad=(4, 6)),
-            sg.Text("", key="-STATUS-", expand_x=True, font=(FONT, 11), text_color=MUTED,
-                    background_color=PANEL, pad=(14, 6)),
+            sg.Push(background_color=PANEL),
             shuffle,
+            *what,
             *modes,
             sg.Button("📂  בחירת תיקייה", key="-FOLDER-", font=(FONT, 11, "bold"), border_width=0,
                       button_color=("#ffffff", ACCENT), mouseover_colors=("#ffffff", "#8f82ff"), pad=((14, 10), 6)),
         ]
+        status = [sg.Text("", key="-STATUS-", expand_x=True, font=(FONT, 11), text_color=MUTED,
+                          background_color=PANEL, pad=((12, 12), (0, 4)))]
         progress = [
             sg.ProgressBar(self.bs, orientation="h", size=(1, 5), key="-PROG-", expand_x=True, pad=((10, 8), 0)),
             sg.Text("", key="-TRASH-", font=(FONT, 10, "bold"), text_color=TRASH_COLOUR, background_color=PANEL,
@@ -214,7 +232,7 @@ class App:
             sg.Image(key="-NEXT-", size=THUMB, background_color=PANEL, pad=((4, 12), 8)),
         ]
         layout = [
-            [sg.Column([top, progress], background_color=PANEL, expand_x=True, pad=0)],
+            [sg.Column([top, status, progress], background_color=PANEL, expand_x=True, pad=0)],
             [sg.Image(key="-IMG-", size=self.max_img, pad=(0, (6, 0)))],
             [sg.Canvas(key="-SEEK-", size=(self.max_img[0], SEEK_H), background_color=BG, pad=(0, (0, 4)))],
             [sg.Column([bar], background_color=PANEL, expand_x=True, pad=0)],
@@ -395,7 +413,7 @@ class App:
             self.video.preload(None)
         found = f"{len(paths)}" + ("" if s.scanner.done.is_set() else "+")
         self._set_progress(s.pos)
-        self._set_status(_parts(kind, os.path.relpath(path, s.root), dims, _rtl(f"שוקל {_human(_size(path))}"),
+        self._set_status(_parts(kind, _short(os.path.relpath(path, s.root)), dims, _rtl(f"שוקל {_human(_size(path))}"),
                                 f"נמצאו {found} {what}"))
         if TIMING:
             self.window.refresh()
