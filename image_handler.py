@@ -6,6 +6,7 @@ Nothing in here touches the GUI, so it can be tested on its own.
 import csv
 import datetime
 import os
+import random
 import re
 import shutil
 import threading
@@ -21,6 +22,7 @@ IMAGE_EXTS = {
 
 UNDO_LIMIT = 20
 PREFETCH_AHEAD = 4
+SHUFFLE_FIRST = 500  # shuffle mode: files collected (and mixed) before the first one is shown
 
 Image.MAX_IMAGE_PIXELS = None  # very large panoramas are fine; we only downscale them
 
@@ -36,11 +38,18 @@ class Scanner:
 
     Only files whose extension is in `exts` are collected (default: images). Folders in
     `exclude_dirs` (full paths) and folders named like one of `skip_names` are left out.
+
+    With `shuffle` the order is random. The first SHUFFLE_FIRST files are mixed before any is
+    published; after that each new file swaps places with a random file at or after `floor`,
+    which the caller keeps just past the files it is showing or preloading.
     """
 
-    def __init__(self, root, exclude_dirs=(), exts=IMAGE_EXTS, skip_names=()):
+    def __init__(self, root, exclude_dirs=(), exts=IMAGE_EXTS, skip_names=(), shuffle=False):
         self.root = root
         self.exts = exts
+        self.shuffle = shuffle
+        self.floor = PREFETCH_AHEAD + 2
+        self._first = [] if shuffle else None  # shuffle: files held back until the first mix
         self._skip_names = {n.lower() for n in skip_names}
         self.paths = []
         self.done = threading.Event()
@@ -65,9 +74,30 @@ class Scanner:
                 )
                 for name in sorted(filenames, key=str.lower):
                     if os.path.splitext(name)[1].lower() in self.exts:
-                        self.paths.append(os.path.join(dirpath, name))
+                        self._add(os.path.join(dirpath, name))
         finally:
+            self._publish_first()
             self.done.set()
+
+    def _add(self, path):
+        if not self.shuffle:
+            self.paths.append(path)
+        elif self._first is not None:
+            self._first.append(path)
+            if len(self._first) >= SHUFFLE_FIRST:
+                self._publish_first()
+        else:
+            paths = self.paths
+            paths.append(path)
+            n = len(paths) - 1
+            j = random.randint(min(self.floor, n), n)
+            paths[j], paths[n] = paths[n], paths[j]
+
+    def _publish_first(self):
+        if self._first is not None:
+            random.shuffle(self._first)
+            self.paths.extend(self._first)
+            self._first = None
 
 
 # ---------------------------------------------------------------- loading

@@ -9,6 +9,8 @@ DEFAULTS = {
     "batch_size": 50,
     # Which files to sort: "both", "photos" or "videos".
     "media": "both",
+    # True = go through the files in random order instead of folder by folder.
+    "shuffle": False,
     # Empty target folders mean "<root>/_PhotoSwipe/<name>" (same drive = instant moves).
     "delete_dir": "",
     "keep_dir": "",
@@ -57,6 +59,7 @@ def load():
         cfg["batch_size"] = DEFAULTS["batch_size"]
     if cfg["media"] not in ("both", "photos", "videos"):
         cfg["media"] = DEFAULTS["media"]
+    cfg["shuffle"] = bool(cfg["shuffle"])
     return cfg
 
 

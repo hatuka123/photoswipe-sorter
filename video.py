@@ -7,6 +7,11 @@ Three players take turns, each drawing into its own panel:
   - "closing": a video being stopped in the background. Stopping VLC can take a while (the
                first time, Windows Defender scans VLC's plugins as they load), so the window
                never waits for it; the file is only moved once VLC has let go of it.
+
+Sound: VLC's mute switch belongs to the whole program's audio session (all three players share
+it) and Windows remembers it between runs. So it is never used to keep a player quiet: the
+prepared and closing players have their audio track switched off instead, and the video on
+screen is unmuted again whenever something muted the session.
 """
 
 import os
@@ -183,9 +188,10 @@ class VideoPool:
         if media is None:
             return False
         media.add_option("input-repeat=65535")  # loop until the user decides
+        if silent:
+            media.add_option("no-audio")  # starts with the track off; _sound_on turns it on
         slot.player.set_media(media)
         media.release()
-        slot.player.audio_set_mute(self.muted or silent)
         slot.path = path
         slot.primed = False
         slot.started = time.monotonic()
@@ -198,7 +204,7 @@ class VideoPool:
         if slot is self._cur:
             self._cur = None
         slot.role = "closing"
-        slot.player.audio_set_mute(True)
+        slot.player.audio_set_track(-1)
         self._park(slot)
 
         def stop():
@@ -208,6 +214,18 @@ class VideoPool:
             slot.role = "free"
 
         threading.Thread(target=stop, daemon=True).start()
+
+    def _sound_on(self, slot):
+        """Make sure the video on screen is heard (unless M was pressed for this video)."""
+        p = slot.player
+        if p.audio_get_track() == -1:
+            track = next((t for t, _ in p.audio_get_track_description() or () if t >= 0), None)
+            if track is not None:
+                p.audio_set_track(track)
+        if p.audio_get_mute() == 1 and not self.muted:
+            p.audio_set_mute(False)
+        if 0 <= p.audio_get_volume() < 100:
+            p.audio_set_volume(100)
 
     def _free(self):
         return next((s for s in self._slots if s.role == "free"), None)
@@ -226,6 +244,7 @@ class VideoPool:
             self._unpark(self._cur)
             return True
         old = self._cur
+        self.muted = False  # every video starts with sound
         pre = next((s for s in self._slots if s.role == "pre" and s.path == path), None)
         if pre is not None:  # prepared: swap
             pre.role = "cur"
@@ -233,7 +252,7 @@ class VideoPool:
             pre.panel.update_idletasks()
             if not pre.primed:  # still starting up: begin from the start anyway
                 pre.player.set_time(0)
-            pre.player.audio_set_mute(self.muted)
+            self._sound_on(pre)
             pre.player.set_pause(0)
             pre.started = time.monotonic()
             self._cur = pre
@@ -246,6 +265,7 @@ class VideoPool:
                 return None
             if not self._open(slot, path, silent=False):
                 return False
+            self._sound_on(slot)
             slot.role = "cur"
             self._unpark(slot)
             self._cur = slot
@@ -289,6 +309,8 @@ class VideoPool:
                 s.player.set_pause(1)  # its first frame is on the (hidden) panel now
                 s.player.set_time(0)
                 s.primed = True
+        if self._cur is not None:  # the audio output only exists a moment after playing starts
+            self._sound_on(self._cur)
 
     def release(self, path):
         """Start closing `path` in whichever player has it (see holds() for when it's done)."""
@@ -313,6 +335,17 @@ class VideoPool:
     def toggle_pause(self):
         if self._cur is not None:
             self._cur.player.pause()
+
+    def position(self):
+        """(elapsed ms, length ms) of the video on screen, or None (length 0 = not known yet)."""
+        s = self._cur
+        if s is None:
+            return None
+        return max(0, s.player.get_time()), max(0, s.player.get_length())
+
+    def seek(self, ms):
+        if self._cur is not None:
+            self._cur.player.set_time(int(ms))
 
     def toggle_mute(self):
         self.muted = not self.muted

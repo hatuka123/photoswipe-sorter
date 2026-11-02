@@ -83,6 +83,7 @@ def main_test():
     check(count("delete") == 5 and count("keep") == 5 and count("star") == 5,
           f"5 photos in each folder (delete={count('delete')}, keep={count('keep')}, star={count('star')})")
     check(not any(os.path.exists(p) for p in first15), "moved photos left their original place")
+    check("שוקל" in app.window["-STATUS-"].get(), "status shows the file size")
 
     print("2. undo 10 times with DOWN")
     last10 = [a.src for a in app.session.sorter.history[-10:]]
@@ -94,6 +95,8 @@ def main_test():
         rows = list(csv.DictReader(f))
     undone = [r["to"] for r in rows if r["action"].startswith("undo")]
     check(undone == list(reversed(last10)), "undo happened in reverse order (checked in log)")
+    trash = (app.session.trash_bytes, app.session.trash_files)
+    check(trash == main._usage(targets["delete"]), f"to-delete total matches the delete-queue folder {trash}")
 
     print("3. undo limit of 20")
     for _ in range(25):
@@ -127,6 +130,9 @@ def main_test():
           "photos from all sub-folders sit directly in the target folders (no sub-folders)")
     check(os.path.exists(os.path.join(root, "broken.jpg")), "broken file skipped and left alone")
     check(os.path.exists(os.path.join(root, "notes.txt")), "non-image left alone")
+    trash = (app.session.trash_bytes, app.session.trash_files)
+    check(trash == main._usage(targets["delete"]) and "GB" in app.window["-TRASH-"].get(),
+          f"to-delete total shown and matches the folder {trash}")
 
     print("7. config remembered")
     check(config.load()["root_folder"] == os.path.abspath(root), "root folder saved in config.json")
@@ -163,7 +169,6 @@ def video_test():
     video._import_vlc = slow_import
     app = main.App()
     app.ask_next_batch = lambda n: "next"
-    app._get_video().muted = True  # the test doesn't need to be heard
     t = time.perf_counter()
     app.start_session(root)
     app.window.refresh()
@@ -209,6 +214,25 @@ def video_test():
     check(app.video.player.audio_get_track_count() > 0, "video has sound")
     check("0:0" in app.window["-STATUS-"].get(), "status shows the video clock")
 
+    def audible():
+        p = app.video.player
+        return p.audio_get_mute() == 0 and p.audio_get_track() != -1
+
+    check(pump_until(audible, 3), "video plays with sound on")
+    length = app.video.player.get_length()
+    x0, x1 = app._seek_x
+    app._seek_mouse(x0 + (x1 - x0) // 2, "press")
+    app._seek_mouse(x0 + (x1 - x0) * 3 // 4, "drag")
+    app._seek_mouse(x0 + (x1 - x0) // 2, "release")
+    pump(0.3)
+    got = app.video.player.get_time()
+    check(abs(got - length / 2) < 800, f"dragging the bar jumps to the middle ({got} of {length} ms)")
+    c = app.window["-SEEK-"].TKCanvas
+    check(c.itemcget(app._seek_items["knob"], "state") == "normal", "position bar shown under the video")
+    key(77)  # M: mute this video only
+    pump(0.3)
+    check(app.video.player.audio_get_mute() == 1, "M mutes")
+
     key(32)
     pump(0.3)
     check(app.video.player.get_state() == vlc.State.Paused, "SPACE pauses")
@@ -224,6 +248,7 @@ def video_test():
     check(not os.path.exists(first) and os.path.exists(os.path.join(targets["keep"], os.path.basename(first))),
           "playing video moved to keep-archive")
     check(ms is not None, f"next video plays ({(time.perf_counter() - start) * 1000:.0f} ms from key press)")
+    check(pump_until(audible, 3), "next video has sound again, though the last one was muted")
     key(DOWN)
     ms = wait_playing()
     check(os.path.exists(first) and app.video.path == first and ms is not None,
@@ -258,6 +283,25 @@ def video_test():
     app.session.scanner.done.wait(10)
     check(len(app.session.scanner.paths) == len(photos) - 3, "both: the remaining 7 photos (videos already sorted)")
     check(config.load()["media"] == "both", "mode remembered in config.json")
+
+    print("11. shuffle")
+    before = sorted(app.session.scanner.paths)
+    app.set_shuffle(True)
+    app.session.scanner.done.wait(10)
+    after = sorted(p for p in app.session.scanner.paths if not p.endswith("broken.jpg"))  # skipped when reached
+    check(after == before and config.load()["shuffle"],
+          "same files after switching shuffle on, setting remembered")
+    from image_handler import Scanner
+    many = os.path.join(tmp, "many")
+    for d in ("a", "b", "c"):
+        os.makedirs(os.path.join(many, d))
+        for i in range(400):
+            open(os.path.join(many, d, f"{i:04d}.jpg"), "wb").close()
+    sc = Scanner(many, shuffle=True)
+    sc.done.wait(10)
+    check(len(sc.paths) == 1200 and len(set(sc.paths)) == 1200, "shuffled scan lists every file once")
+    check(sc.paths != sorted(sc.paths) and os.path.join(many, "c") in "".join(sc.paths[:30]),
+          "shuffled order mixes all folders from the start")
 
     app.video.close()
     app.window.close()

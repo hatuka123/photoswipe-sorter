@@ -3,6 +3,7 @@
 LEFT / A  -> delete-queue      RIGHT / D -> keep-archive
 UP / W    -> starred           DOWN / Z  -> undo last action
 SPACE     -> pause video       M         -> mute video
+The bar under a video shows how far it has played; click or drag it to jump.
 """
 
 import os
@@ -17,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import config
 from image_handler import IMAGE_EXTS, PREFETCH_AHEAD, Frame, Prefetcher, Scanner, Sorter, load_frame
-from video import PANELS, VIDEO_EXTS, VideoPool, is_video
+from video import PANELS, VIDEO_EXTS, VideoPool, _fmt, is_video
 
 # Windows virtual key codes, so the letters also work with the Hebrew keyboard layout.
 KEYS = {37: "delete", 65: "delete", 39: "keep", 68: "keep", 38: "star", 87: "star", 40: "undo", 90: "undo",
@@ -47,6 +48,9 @@ STARTING = "מפעיל את נגן הווידאו..."
 NOTHING_TO_UNDO = "אין מה לבטל"
 MODE_EXTS = {"both": IMAGE_EXTS | VIDEO_EXTS, "photos": IMAGE_EXTS, "videos": VIDEO_EXTS}
 THUMB = (160, 120)
+SEEK_H, SEEK_SIDE = 30, 70  # video position bar: height, room for the clock on each side
+SEEK_FILL = "#eceef2"
+TRASH_COLOUR = "#ef5a62"
 TIMING = os.environ.get("PHOTOSWIPE_TIMING") == "1"
 # Test hook: "keep,keep,delete,undo,..." is performed one action every 1.5 s (used to test the .exe).
 SCRIPT = [a for a in os.environ.get("PHOTOSWIPE_SCRIPT", "").split(",") if a]
@@ -69,6 +73,37 @@ def _parts(*parts):
     """Join status parts with " · ". Each part is fenced with left-to-right marks, so Windows
     doesn't mix up the order of Hebrew words, numbers and file paths standing next to each other."""
     return "   ·   ".join(f"‎{p}‎" for p in parts if p)
+
+
+def _rtl(text):
+    """Hebrew mixed with numbers and Latin units ("שוקל 3.2 MB"): lay it out right-to-left, or
+    inside the left-to-right status line the number jumps in front of the Hebrew word."""
+    return f"‫{text}‬"
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _human(n):
+    if n < 1024 ** 2:
+        return f"{n / 1024:.0f} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB"
+    return f"{n / 1024 ** 3:.2f} GB"
+
+
+def _usage(folder):
+    """(bytes, number of photos/videos) in `folder` and below."""
+    total = files = 0
+    for dirpath, _, names in os.walk(folder):
+        for name in names:
+            total += _size(os.path.join(dirpath, name))
+            files += os.path.splitext(name)[1].lower() in MODE_EXTS["both"]
+    return total, files
 
 
 def _video_thumb():
@@ -95,6 +130,8 @@ class Session:
         # only moved once the player has let go of the file; later moves wait their turn so
         # the undo history stays in order.
         self.pending = deque()
+        # What is (or is about to be) in the delete-queue folder, pending moves included.
+        self.trash_bytes, self.trash_files = _usage(sorter.targets["delete"])
 
 
 class App:
@@ -107,7 +144,7 @@ class App:
         if os.path.exists(ICON):
             sg.set_options(icon=ICON)  # every window, including the "next batch" question
         sw, sh = sg.Window.get_screen_size()
-        self.max_img = (max(320, sw - 40), max(240, sh - 250))
+        self.max_img = (max(320, sw - 40), max(240, sh - 250 - SEEK_H))
         try:
             self._logo = Image.open(LOGO).convert("RGBA")
         except OSError:
@@ -136,10 +173,15 @@ class App:
         self._thumb = None  # keep the Tk image referenced
         self._recent = {}  # original path -> Frame of the last few sorted photos
         self._no_thumb = ImageTk.PhotoImage(Image.new("RGB", THUMB, PANEL))
+        self._seek_drag = None  # ms under the mouse while the position bar is being dragged
+        self._seek_at = 0.0
+        self._build_seek()
 
     def _build_window(self):
         modes = [sg.Radio(label, "mode", key=f"-MODE-{m}", enable_events=True, font=(FONT, 10),
                           background_color=PANEL, default=(m == self.cfg["media"])) for m, label in MODES.items()] if VIDEOS_ENABLED else []
+        shuffle = sg.Checkbox("🔀  סדר אקראי", key="-SHUFFLE-", enable_events=True, font=(FONT, 10),
+                              background_color=PANEL, default=self.cfg["shuffle"], pad=((14, 4), 6))
         actions = []
         for key, (label, hint, fg, bg, hover) in ACTION_STYLE.items():
             actions.append(sg.Button(f"{label}\n{hint}", key=key, font=(FONT, 12, "bold"), size=(12, 2),
@@ -150,12 +192,15 @@ class App:
             sg.Text("PhotoSwipe", font=(FONT, 14, "bold"), background_color=PANEL, pad=(4, 6)),
             sg.Text("", key="-STATUS-", expand_x=True, font=(FONT, 11), text_color=MUTED,
                     background_color=PANEL, pad=(14, 6)),
+            shuffle,
             *modes,
             sg.Button("📂  בחירת תיקייה", key="-FOLDER-", font=(FONT, 11, "bold"), border_width=0,
                       button_color=("#ffffff", ACCENT), mouseover_colors=("#ffffff", "#8f82ff"), pad=((14, 10), 6)),
         ]
         progress = [
             sg.ProgressBar(self.bs, orientation="h", size=(1, 5), key="-PROG-", expand_x=True, pad=((10, 8), 0)),
+            sg.Text("", key="-TRASH-", font=(FONT, 10, "bold"), text_color=TRASH_COLOUR, background_color=PANEL,
+                    pad=((0, 14), (0, 6))),
             sg.Text("", key="-COUNT-", font=(FONT, 10), text_color=MUTED, background_color=PANEL,
                     pad=((0, 10), (0, 6))),
         ]
@@ -170,21 +215,22 @@ class App:
         ]
         layout = [
             [sg.Column([top, progress], background_color=PANEL, expand_x=True, pad=0)],
-            [sg.Image(key="-IMG-", size=self.max_img, pad=(0, 6))],
+            [sg.Image(key="-IMG-", size=self.max_img, pad=(0, (6, 0)))],
+            [sg.Canvas(key="-SEEK-", size=(self.max_img[0], SEEK_H), background_color=BG, pad=(0, (0, 4)))],
             [sg.Column([bar], background_color=PANEL, expand_x=True, pad=0)],
         ]
         # enable_close_attempted_event: on X we stop VLC first, while its parent window still exists.
         w = sg.Window("PhotoSwipe – מיון תמונות וסרטונים", layout, finalize=True, resizable=True,
                       use_default_focus=False, enable_close_attempted_event=True, margins=(0, 0),
                       element_justification="center", return_keyboard_events=False)
-        for m in MODES if VIDEOS_ENABLED else ():
-            w[f"-MODE-{m}"].widget.configure(selectcolor=BG, activebackground=PANEL, activeforeground=TEXT,
+        for key in [*(f"-MODE-{m}" for m in MODES if VIDEOS_ENABLED), "-SHUFFLE-"]:
+            w[key].widget.configure(selectcolor=BG, activebackground=PANEL, activeforeground=TEXT,
                                              highlightthickness=0)
         if self._logo is not None:
             self._logo_tk = ImageTk.PhotoImage(self._logo.resize((30, 30), Image.LANCZOS))
             w["-LOGO-"].widget.configure(image=self._logo_tk)
         # Buttons must never hold the keyboard focus, or SPACE (pause) would also "click" them.
-        for key in [*BUTTONS, "-FOLDER-", *(f"-MODE-{m}" for m in MODES if VIDEOS_ENABLED)]:
+        for key in [*BUTTONS, "-FOLDER-", "-SHUFFLE-", *(f"-MODE-{m}" for m in MODES if VIDEOS_ENABLED)]:
             w[key].widget.configure(takefocus=0, cursor="hand2")
         w.bind("<KeyPress>", "-KEY-")
         w.bind("<KeyRelease>", "-KEYUP-")
@@ -234,6 +280,8 @@ class App:
                 s.sorter.apply(kind, src, pos, batch)
             except OSError as e:
                 self.window["-MSG-"].update(f"לא ניתן להעביר את {os.path.basename(src)}: {e}")
+                if kind == "delete":
+                    self._count_trash(src, -1)
 
     def start_session(self, root):
         if self.session:
@@ -247,7 +295,8 @@ class App:
         except OSError as e:
             self.window["-MSG-"].update(f"לא ניתן לשנות את שם התיקייה _PhotoSwipe: {e}")
         targets = config.target_dirs(self.cfg, root)
-        scanner = Scanner(root, targets.values(), MODE_EXTS[self.cfg["media"]], skip_names=config.SKIP_DIRS)
+        scanner = Scanner(root, targets.values(), MODE_EXTS[self.cfg["media"]], skip_names=config.SKIP_DIRS,
+                          shuffle=self.cfg["shuffle"])
         self.session = Session(root, scanner, Sorter(root, targets, config.log_path(self.cfg)))
         self.cfg["root_folder"] = root
         config.save(self.cfg)
@@ -276,6 +325,15 @@ class App:
         if self.session:
             self.start_session(self.session.root)
 
+    def set_shuffle(self, on):
+        self.window.TKroot.focus_set()
+        if on == self.cfg["shuffle"]:
+            return
+        self.cfg["shuffle"] = on
+        config.save(self.cfg)
+        if self.session:
+            self.start_session(self.session.root)  # rescan in the new order
+
     # ------------------------------------------------------------ display
 
     def show(self):
@@ -284,6 +342,7 @@ class App:
         self.waiting = False
         self.video_pending = False
         what = WHAT[self.cfg["media"]]
+        self._set_trash()
         if s is None:
             self._stop_video()
             self._set_photo(self._welcome(), None)
@@ -291,6 +350,7 @@ class App:
             self._set_status("כדי להתחיל, לחצו על \"בחירת תיקייה\" למעלה")
             return
         paths = s.scanner.paths
+        s.scanner.floor = s.pos + PREFETCH_AHEAD + 2  # shuffle never moves what is shown or preloaded
         while True:
             if s.pos >= len(paths):
                 self._stop_video()
@@ -320,12 +380,13 @@ class App:
                 self.window["-MSG-"].update(pool.error or "לא ניתן לנגן את הסרטון (אפשר עדיין למיין אותו)")
             elif self.window["-MSG-"].get() == STARTING:
                 self.window["-MSG-"].update("")
-            size, kind = "", "סרטון"
+            dims, kind = "", "סרטון"
         else:
             if self.video is not None:
                 self.video.hide()
             self._set_photo(frame, nxt)
-            size, kind = f"{frame.image.width}×{frame.image.height}", "תמונה"
+            dims, kind = f"{frame.image.width}×{frame.image.height}", "תמונה"
+        self._draw_seek()
         # Only now let the workers start on the next files, so they don't compete with drawing.
         self.prefetch.want(paths[s.pos:s.pos + PREFETCH_AHEAD + 1])
         if nxt is not None and is_video(nxt):
@@ -334,7 +395,8 @@ class App:
             self.video.preload(None)
         found = f"{len(paths)}" + ("" if s.scanner.done.is_set() else "+")
         self._set_progress(s.pos)
-        self._set_status(_parts(kind, os.path.relpath(path, s.root), size, f"נמצאו {found} {what}"))
+        self._set_status(_parts(kind, os.path.relpath(path, s.root), dims, _rtl(f"שוקל {_human(_size(path))}"),
+                                f"נמצאו {found} {what}"))
         if TIMING:
             self.window.refresh()
             ms = (time.perf_counter() - t0) * 1000
@@ -349,6 +411,88 @@ class App:
         extra = self.video.status() if self.video is not None and self.video.path else ""
         self.window["-STATUS-"].update(_parts(self._status, extra, "רווח = עצירה,  M = השתקה")
                                        if extra else self._status)
+
+    def _count_trash(self, path, sign):
+        s = self.session
+        s.trash_bytes = max(0, s.trash_bytes + sign * _size(path))
+        s.trash_files = max(0, s.trash_files + sign)
+        self._set_trash()
+
+    def _set_trash(self):
+        """How much is waiting in the delete-queue folder."""
+        s = self.session
+        if s is None or not s.trash_files:
+            self.window["-TRASH-"].update("")
+            return
+        files = "קובץ אחד" if s.trash_files == 1 else f"{s.trash_files} קבצים"
+        self.window["-TRASH-"].update(_parts(_rtl(f"🗑  למחיקה: {s.trash_bytes / 1024 ** 3:.2f} GB"), _rtl(files)))
+
+    # ------------------------------------------------------------ video position bar
+
+    def _build_seek(self):
+        c = self.window["-SEEK-"].TKCanvas
+        c.configure(highlightthickness=0, cursor="hand2", takefocus=0)
+        w, mid = self.max_img[0], SEEK_H // 2
+        self._seek_x = (SEEK_SIDE, w - SEEK_SIDE)
+        self._seek_items = {
+            "elapsed": c.create_text(SEEK_SIDE - 12, mid, anchor="e", fill=TEXT, font=(FONT, 10)),
+            "left": c.create_text(w - SEEK_SIDE + 12, mid, anchor="w", fill=MUTED, font=(FONT, 10)),
+            "track": c.create_rectangle(SEEK_SIDE, mid - 3, w - SEEK_SIDE, mid + 3, fill="#3a3d46", width=0),
+            "fill": c.create_rectangle(SEEK_SIDE, mid - 3, SEEK_SIDE, mid + 3, fill=SEEK_FILL, width=0),
+            "knob": c.create_oval(0, 0, 0, 0, fill="#ffffff", outline=BG, width=2),
+        }
+        c.bind("<ButtonPress-1>", lambda e: self._seek_mouse(e.x, "press"))
+        c.bind("<B1-Motion>", lambda e: self._seek_mouse(e.x, "drag"))
+        c.bind("<ButtonRelease-1>", lambda e: self._seek_mouse(e.x, "release"))
+        self._draw_seek()
+
+    def _video_position(self):
+        """(elapsed ms, length ms) of the video on screen, or None."""
+        if self.video is None or self.video.path is None or not self.video.ready or self.video.error:
+            return None
+        return self.video.position()
+
+    def _seek_mouse(self, x, what):
+        pos = self._video_position()
+        if pos is None or pos[1] <= 0:
+            self._seek_drag = None
+            return
+        x0, x1 = self._seek_x
+        ms = min(1.0, max(0.0, (x - x0) / (x1 - x0))) * pos[1]
+        if what == "release":
+            self._seek_drag = None
+            self.video.seek(ms)
+        else:
+            self._seek_drag = ms
+            now = time.monotonic()
+            if what == "press" or now - self._seek_at > 0.08:  # jump along while dragging
+                self._seek_at = now
+                self.video.seek(ms)
+        self._draw_seek(override=ms)
+
+    def _draw_seek(self, override=None):
+        """The bar under a video: played part, knob, time played and time left."""
+        c, items = self.window["-SEEK-"].TKCanvas, self._seek_items
+        pos = self._video_position()
+        if pos is None:
+            self._seek_drag = None
+            for item in items.values():
+                c.itemconfigure(item, state="hidden")
+            return
+        t, total = pos
+        if override is not None:
+            t = override
+        elif self._seek_drag is not None:
+            t = self._seek_drag
+        x0, x1 = self._seek_x
+        mid = SEEK_H // 2
+        x = x0 + (x1 - x0) * (min(1.0, t / total) if total > 0 else 0)
+        c.coords(items["fill"], x0, mid - 3, x, mid + 3)
+        c.coords(items["knob"], x - 8, mid - 8, x + 8, mid + 8)
+        c.itemconfigure(items["elapsed"], text=_fmt(int(t)))
+        c.itemconfigure(items["left"], text=f"-{_fmt(int(max(0, total - t)))}" if total > 0 else "")
+        for item in items.values():
+            c.itemconfigure(item, state="normal")
 
     def _set_progress(self, pos):
         """Batch progress bar and "12 / 50 · batch 3"; pos None = nothing being sorted."""
@@ -420,6 +564,8 @@ class App:
             if nxt is not None and is_video(nxt) and (s.pos + 1) % self.bs:
                 self.video.show(nxt)  # swap to the preloaded next video right away
             self.video.release(src)  # Windows can't move a file that is still open
+        if kind == "delete":
+            self._count_trash(src, +1)
         s.pending.append((kind, src, s.pos, s.pos // self.bs + 1))
         self._flush_moves()
         frame = self.prefetch.peek(src)
@@ -442,6 +588,8 @@ class App:
         s = self.session
         if s.pending:  # not carried out yet: just forget the decision
             kind, src, pos, batch = s.pending.pop()
+            if kind == "delete":
+                self._count_trash(src, -1)
             s.pos = pos
             self.window["-MSG-"].update(f"בוטל: {os.path.basename(src)} נשאר במקום")
             self.show()
@@ -456,6 +604,8 @@ class App:
             self.show()
             return
         action, restored = res
+        if action.kind == "delete":
+            self._count_trash(restored, -1)
         if restored != action.src and action.src in self._recent:
             self._recent[restored] = self._recent.pop(action.src)
         s.pos = action.pos
@@ -518,7 +668,7 @@ class App:
                 or (self.session is not None and bool(self.session.pending))
                 or (self.video is not None and self.video.busy()))
         if timeout is None and (busy or playing):
-            timeout = 100 if busy else 250
+            timeout = 100  # also moves the video position bar along
         event, _ = self.window.read(timeout=timeout)
         if event in (sg.WIN_CLOSED, sg.WINDOW_CLOSE_ATTEMPTED_EVENT):
             return False
@@ -529,6 +679,7 @@ class App:
                 self._update_thumb()
             if playing:
                 self._refresh_status()  # video clock
+                self._draw_seek()
         elif event == "-KEY-":
             code = self.window.user_bind_event.keycode
             if code in KEYS and code not in self.held:  # ignore auto-repeat while held
@@ -542,6 +693,8 @@ class App:
             self.act(BUTTONS[event])
         elif event == "-FOLDER-":
             self.choose_folder()
+        elif event == "-SHUFFLE-":
+            self.set_shuffle(bool(self.window["-SHUFFLE-"].get()))
         elif isinstance(event, str) and event.startswith("-MODE-"):
             self.set_mode(event[len("-MODE-"):])
         return True
